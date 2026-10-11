@@ -1,4 +1,4 @@
-"""Read container memory, never the host's /proc/meminfo."""
+"""Read scoped cgroup memory or explicitly selected WSL VM memory."""
 
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -27,12 +27,24 @@ class Memory:
     inactive_file: int
     dirty: int
     writeback: int
+    source: str = "cgroup"
+    swap_current: int | None = None
+    swap_maximum: int | None = None
 
     @property
     def working_set(self) -> int:
         # Dirty/writeback pages cannot be assumed immediately reclaimable.
         reclaimable = max(0, self.inactive_file - self.dirty - self.writeback)
         return max(0, self.current - reclaimable)
+
+    @property
+    def available(self) -> int:
+        return max(0, self.maximum - self.working_set)
+
+    def metrics(self) -> dict:
+        return {"source": self.source, "path": self.path, "maximum": self.maximum,
+                "current": self.current, "working_set": self.working_set, "available": self.available,
+                "swap_current": self.swap_current, "swap_maximum": self.swap_maximum}
 
 
 def read_memory(path: Path) -> Memory | None:
@@ -44,8 +56,38 @@ def read_memory(path: Path) -> Memory | None:
         raise ValueError("invalid cgroup memory.max")
     stats = dict(line.split() for line in (path / "memory.stat").read_text().splitlines())
     current = int((path / "memory.current").read_text())
+    swap_current = (path / "memory.swap.current").read_text().strip() if (path / "memory.swap.current").exists() else None
+    swap_maximum = (path / "memory.swap.max").read_text().strip() if (path / "memory.swap.max").exists() else None
     return Memory(str(path), maximum_int, current, int(stats.get("inactive_file", 0)),
-                  int(stats.get("file_dirty", 0)), int(stats.get("file_writeback", 0)))
+                  int(stats.get("file_dirty", 0)), int(stats.get("file_writeback", 0)),
+                  swap_current=int(swap_current) if swap_current is not None else None,
+                  swap_maximum=int(swap_maximum) if swap_maximum not in (None, "max") else None)
+
+
+def read_wsl_memory(path: Path) -> Memory:
+    # A container's meminfo may describe its host. Only read the native file
+    # in explicitly selected WSL mode on a WSL kernel. Overrides are fixtures.
+    if path == Path("/proc/meminfo") and "microsoft" not in Path("/proc/sys/kernel/osrelease").read_text().lower():
+        raise RuntimeError("WSL mode requires a WSL kernel; container mode uses cgroup memory")
+    required = {"MemTotal", "MemAvailable", "SwapTotal", "SwapFree"}
+    values = {}
+    for line in path.read_text().splitlines():
+        fields = line.split()
+        if not fields or fields[0].rstrip(":") not in required:
+            continue
+        if len(fields) != 3 or fields[2] != "kB":
+            raise ValueError("invalid WSL memory metrics")
+        values[fields[0].rstrip(":")] = int(fields[1]) * 1024
+    if values.keys() != required:
+        raise ValueError("missing WSL memory metrics")
+    total, available = values["MemTotal"], values["MemAvailable"]
+    swap_total, swap_free = values["SwapTotal"], values["SwapFree"]
+    if total <= 0 or not 0 <= available <= total or not 0 <= swap_free <= swap_total:
+        raise ValueError("invalid WSL memory metrics")
+    # MemAvailable already estimates reclaimable memory. Swap is reported
+    # separately, and is not added to the usable physical-memory capacity.
+    return Memory(str(path), total, total - available, 0, 0, 0, source="wsl",
+                  swap_current=swap_total - swap_free, swap_maximum=swap_total)
 
 
 def _unescape_mount(text: str) -> str:

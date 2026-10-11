@@ -1,8 +1,8 @@
 # agent-memguard
 
-给 coding agent 执行的命令加一层内存保护。命令超过任务预算或容器内存压力过高时，终止命令及其后代，并把原因、内存指标和退出码返回给 agent。
+给 coding agent 执行的命令加一层环境内存压力保护。内存充足时允许任务继续增长；只有容器或 WSL 虚拟机整体内存紧张时，才选择受保护任务终止，并返回原因、内存指标和退出码。没有单进程或单任务 RSS 上限。
 
-Linux、cgroup v2、Python 3.10+，运行时只依赖 Python 标准库。适用于 cgroup 只读、不能给每个任务创建独立内存限制的容器。
+Linux（含 WSL2）、cgroup v2、Python 3.10+，运行时只依赖 Python 标准库。容器读取 cgroup 内存，WSL2 读取虚拟机可用内存；运行时无需管理员权限。
 
 ## 快速开始
 
@@ -10,8 +10,8 @@ Linux、cgroup v2、Python 3.10+，运行时只依赖 Python 标准库。适用�
 
 ```bash
 ./bin/memguard --check
-./bin/memguard --limit 1G -- python script.py
-./bin/memguard --limit 512M -- bash -c 'command_a | command_b'
+./bin/memguard -- python3 script.py
+./bin/memguard -- bash -c 'command_a | command_b'
 ```
 
 也可以安装到独立虚拟环境：
@@ -22,35 +22,76 @@ python3 -m venv .venv
 .venv/bin/memguard --check
 ```
 
-`--check` 只打印有效配置和当前 cgroup 内存，不执行目标命令。没有有限 cgroup 内存上限时默认拒绝启动；明确使用 `--allow-unlimited` 才允许仅按任务 RSS 保护。
+`--check` 打印当前环境总量、可用内存、整体软/硬阈值和交换区指标，不执行目标命令。默认使用容器模式，没有有限 cgroup 内存上限时拒绝启动；当前 WSL2 使用 `--mode wsl`。
+
+## 环境切换
+
+命令行用一个参数切换：
+
+```bash
+# 原集群容器：监控整个受限 cgroup 及有限父层级
+./bin/memguard --mode container -- python3 script.py
+
+# 当前 WSL2：监控整个 WSL 虚拟机的实时可用内存
+./bin/memguard --mode wsl -- python3 script.py
+./bin/memguard --mode wsl --check
+```
+
+CLI、OpenCode 的 shell 入口和 Codex hook 都支持同一个环境变量：
+
+```bash
+export MEMGUARD_MODE=wsl        # WSL2
+# export MEMGUARD_MODE=container  # 切回集群容器（默认）
+```
+
+在启动 agent 前设置，使 shell/hook 继承该变量；已有实例需要重启。CLI 的 `--mode` 优先于环境变量，非法模式会拒绝执行命令；hook 会返回 `deny`。hook 会把模式写入改写后的命令，执行端无需再次配置环境变量。
+
+两种模式均使用环境压力保护，`--check` 显示 `protection: "environment-pressure"`、`task_rss_limit: null`。RSS 合计只用于选择受害任务，不会单独触发内存终止。任务增长到几 GiB 也可以继续运行，只要整体内存仍充足。
+
+WSL 模式每次采样读取 `/proc/meminfo` 的 `MemTotal`、`MemAvailable`，用 `MemTotal - MemAvailable` 表示已占用且不易回收的内存；可回收缓存由内核的 `MemAvailable` 估算。若存在有限 cgroup 上限，也同时监控这些层级。读取原生 `/proc/meminfo` 前会确认当前是 WSL 内核；容器模式不会回退读取可能属于宿主机的指标。WSL 保护范围是 Linux 虚拟机，不包含 Windows 原生进程。
+
+启动前只检查环境是否已经达到软压力阈值，不为每个任务预留固定预算。运行中持续重读总量、可用量及有限 cgroup 范围；上限或可用内存变化后，会按最新指标判断压力。
+
+旧版的 `--limit`、`--allow-unlimited` 参数已移除，调用脚本需要删除这些参数。`MEMGUARD_LIMIT` 不再使用，也不再提供 RSS-only 模式。更新后重启现有启动器，使所有任务统一采用新的保护策略。
 
 ## 保护机制
 
-1. 启动前读取 cgroup 内存并登记任务预算。并发任务共享登记表，对还没有使用的预算做保守准入检查。
+1. 启动前读取环境内存，若已经达到软阈值则拒绝启动；通过后登记任务和所属环境层级。
 2. 将任务放进独立会话，执行目标程序前把 `oom_score_adj` 设置为 `+500`。避免高内存命令继承 Paseo/agent 的负值保护。设置失败时不执行命令。
-3. 每 250 ms 读取容器指标和 `/proc`，统计任务后代的 RSS 合计。共享内存会重复计算，因此偏保守。
-4. 任务超过预算时发送 TERM；容器到达软阈值并持续 500 ms 时，在登记任务中优先选择占用大、近期增长明显的任务。并发启动器协调选一个任务，避免同时全部终止。
-5. 容器到达硬阈值时立即 KILL；其他情况下 TERM 宽限最多 500 ms。KILL 后继续清理后代。
+3. 每 250 ms 读取环境指标和 `/proc`，统计任务后代 RSS 及增长量，用于受害任务排序。共享内存可能重复计算，但不会因此限制任务大小。
+4. 环境达到软阈值并持续 500 ms 时，优先选择 RSS 大、近期增长明显的任务，发送 TERM。同一承压层级的并发启动器协调选一个任务。
+5. 硬压力下对选中任务发送 KILL；其他情况下默认 TERM 宽限 500 ms。确认整个任务树退出后继续判断余量，压力仍高则冷却后选择下一任务。
 6. 启动器作为 child subreaper，跟踪普通 worker、创建新会话的后代和父进程退出后收养的孤儿。使用 PID + 启动时间核对身份；系统支持时使用 pidfd 发送信号。
 
-容器工作集估算：
+容器工作集估算（只计算实际已使用内存，不含未来任务预算）：
 
 ```text
 可回收部分 = max(0, inactive_file - file_dirty - file_writeback)
 工作集估算 = max(0, memory.current - 可回收部分)
 ```
 
-这不是精确的不可回收内存量。不会把 `slab_reclaimable` 全部扣除，也不会使用可能显示宿主机内存的 `/proc/meminfo`。
+这不是精确的不可回收内存量。不会把 `slab_reclaimable` 全部扣除；容器模式不读取 `/proc/meminfo`。
 
 会检查本进程 cgroup 到可见挂载根之间所有有限上限。任一有限层级触发压力即可保护。
+
+每次采样会刷新有限上限的协调范围。启动时为 `memory.max=max` 的层级，运行期间设置有限上限后也会参与压力保护；取消上限后则移出范围。多个任务只共享无限上限的祖先时，不会因此互相阻挡终止选择。
+
+同一 PID/cgroup 命名空间内的启动器共享登记表。压力选择只考虑属于承压环境的任务，WSL 虚拟机压力可在登记任务中选择；兄弟 cgroup 各自承压时独立保护，父级承压时共同协调。只有已选任务能释放当前承压层级的内存时，才等待它的终止与冷却。不同启动器使用不同压力阈值时，只有所有报告相关层级压力的启动器都确认恢复，才会撤销尚未执行的请求。
+
+执行终止前会保存原因。其他启动器确认根进程及全部存活后代已退出后，会释放活跃请求，让持续压力下的后续选择继续；终止结果单独保留，直到原启动器读取并退出。即使原启动器停止响应，也不会永久阻挡后续保护；恢复后仍报告 `environment_pressure` 和退出码 125。仅发送 SIGKILL 不会被当作任务树已经退出。
+
+## 交换区
+
+WSL 模式报告 `SwapTotal` 与 `SwapTotal - SwapFree`；容器模式在指标存在时报告 `memory.swap.max`、`memory.swap.current`。交换区单独列出，不加到物理内存容量，也不因 swap 使用率高而单独杀任务。物理内存可用量仍充足时，即使 swap 已用满，任务也允许继续运行；大量空闲 swap 也不会掩盖物理内存已经紧张的情况。当前不根据换入换出速度或 PSI 自动调整阈值。
+
+任务的子级软终止请求尚未完成时，如果该任务受限的父级出现硬压力，会升级已有请求；其他启动器仍可执行兜底 SIGKILL，不必等待受害任务的启动器恢复采样。
 
 ## 默认参数
 
 | 参数 | 默认值 | 对 8 GiB 容器的含义 |
 | --- | --- | --- |
-| 任务 RSS 预算 | 1 GiB | 单次命令及其后代合计 |
-| 容器软阈值 | 81.25% | 6.5 GiB 工作集估算 |
-| 容器硬阈值 | 87.5% | 7 GiB 工作集估算 |
+| 环境软阈值 | 81.25% | 6.5 GiB 工作集估算，约剩余 1.5 GiB |
+| 环境硬阈值 | 87.5% | 7 GiB 工作集估算，约剩余 1 GiB |
 | 采样间隔 | 250 ms | 读取 cgroup 和进程树 |
 | 软阈值持续时间 | 500 ms | 避免短暂波动 |
 | TERM 宽限 | 500 ms | 硬阈值不等待 |
@@ -61,7 +102,7 @@ python3 -m venv .venv
 shell 和 hook 模式使用环境变量调整：
 
 ```bash
-export MEMGUARD_LIMIT=1G
+export MEMGUARD_MODE=container  # WSL2 使用 wsl
 export MEMGUARD_REAL_SHELL=/bin/bash
 export MEMGUARD_INTERVAL=0.25
 export MEMGUARD_SOFT_FRACTION=0.8125
@@ -73,9 +114,11 @@ export MEMGUARD_OOM_SCORE_ADJ=500
 
 共享登记表默认放在 `XDG_RUNTIME_DIR/agent-memguard`；没有该目录时使用本地临时目录 `agent-memguard-<uid>`。推荐本地存储，避免每次采样访问 AFS/NFS。可用 `MEMGUARD_STATE_DIR` 或 `--state-dir` 指定；同一容器的启动器应使用同一目录。目录必须由当前用户拥有，且不能被其他用户写入。登记表不保存命令或环境变量。
 
+登记表格式已升级为 v3，使用新的状态文件；旧版启动器仍可能执行旧 RSS 策略，更新后应统一重启。
+
 部分 AFS 环境会映射 root 创建目录的 UID；这种目录也会被所有权检查拒绝，应使用本地状态目录。
 
-`--no-admission-check` 可跳过启动前预算检查，但不会关闭运行中的保护。`--cgroup-dir` 或 `MEMGUARD_CGROUP_DIR` 用于明确指定控制器位置和模拟指标测试；实际运行应指向任务所属的控制器。
+`--no-admission-check` 可跳过启动时的整体压力检查，但不会关闭运行中的保护。`--cgroup-dir` 或 `MEMGUARD_CGROUP_DIR` 用于明确指定控制器位置；实际运行应指向任务所属的控制器。`--meminfo-file` 或 `MEMGUARD_MEMINFO_FILE` 可注入 WSL 模拟指标供测试，实际 WSL 应使用默认 `/proc/meminfo`。
 
 ## OpenCode v2 接入
 
@@ -95,7 +138,7 @@ OpenCode 按 `memguard-shell -c "原命令"` 调用；启动器监控真正 shel
 cat /proc/self/oom_score_adj
 ```
 
-本机研究针对 OpenCode 2.0.26：自定义路径不存在时可能回退系统 Bash。因此必须确保配置路径存在且可执行，并用低预算任务验收保护。
+本机研究针对 OpenCode 2.0.26：自定义路径不存在时可能回退系统 Bash。因此必须确保配置路径存在且可执行，并用模拟环境压力验收保护。
 
 独立 PTY 插件和 MCP 工具可能直接启动程序，绕过内置 shell；需要另外包装其执行入口，或者禁用这些入口。
 
@@ -123,8 +166,10 @@ cat /proc/self/oom_score_adj
 hook 会保留原命令为一个经过 shell 引号处理的参数，改写为：
 
 ```text
-memguard -- /bin/bash -c '原命令'
+memguard --mode container -- /bin/bash -c '原命令'
 ```
+
+设置 `MEMGUARD_MODE=wsl` 后，改写命令中的模式变为 `--mode wsl`。
 
 自动寻找相邻的 `memguard`，也可用 `MEMGUARD_BIN` 指定绝对可执行路径。无效输入或找不到启动器时，hook 返回有效的 `deny` 决定，而不是用非零退出码导致 Codex 忽略 hook 错误。
 
@@ -145,7 +190,7 @@ Codex 的异步命令可能先返回 session ID，之后再由 `write_stdin` 收
 日志示例：
 
 ```text
-[memguard] {"event":"terminated","reason":"task_rss_limit","task_rss":...,"limit":...}
+[memguard] {"event":"terminated","reason":"environment_pressure","task_rss":...,"environments":[...]}
 ```
 
 `--verbose` 会额外输出启动事件。否则正常成功命令不增加启动器日志。
@@ -156,7 +201,7 @@ Codex 的异步命令可能先返回 session ID，之后再由 `write_stdin` 收
 python3 -m unittest discover -s tests -v
 ```
 
-测试使用几十 MiB 的任务和模拟 cgroup 指标，覆盖输出/退出码、输入、OOM 优先级、worker 合计、孤儿/新会话清理、TERM 升级、缓存、准入、监控失败、Ctrl+C、并发受害任务选择和 hook 引号处理。不会制造真实容器 OOM。
+测试使用几十 MiB 的任务和模拟指标，覆盖两种环境模式、宽裕内存下超过旧 RSS 上限的任务、WSL 实时可用内存与 swap 报告、环境变量与 CLI 优先级、shell/hook 模式传递、输出/退出码、输入、OOM 优先级、孤儿/新会话清理、TERM 升级、缓存、准入、监控失败、Ctrl+C、不同压力阈值、动态上限、父级受害任务选择、停止响应的启动器、持续硬压力下的后续选择、兄弟子级独立保护、2 秒采样下的跨启动器终止原因，以及 hook 引号处理。不会制造真实容器 OOM。
 
 安装了 Codex 的机器可运行可选端到端验收：
 
@@ -164,7 +209,7 @@ python3 -m unittest discover -s tests -v
 python3 tests/integration_codex.py
 ```
 
-使用本地 HTTP 模拟模型、临时 `CODEX_HOME` 和一次性 hook 信任绕过，验收正常命令 stdout/stderr/退出码 7，以及小预算终止的原因和退出码 125。模拟模型会用 `write_stdin` 收取异步结果，不修改日常配置、不调用真实模型。需要本机存在有限 cgroup v2 内存上限。
+使用本地 HTTP 模拟模型、临时 `CODEX_HOME` 和一次性 hook 信任绕过，验收正常命令 stdout/stderr/退出码 7、宽裕内存下的大任务成功，以及模拟环境压力下的退出码 125。模拟模型会用 `write_stdin` 收取异步结果，不修改日常配置、不调用真实模型，不制造真实 OOM。容器和 WSL 指标均使用临时文件，WSL 场景使用 `MEMGUARD_MODE=wsl python3 tests/integration_codex.py`。
 
 可选 GitHub Actions 模板在 [examples/github-actions.yml](examples/github-actions.yml)。复制到 `.github/workflows/tests.yml` 可启用 Python 3.10/3.12/3.13 的测试矩阵。
 
@@ -172,12 +217,12 @@ python3 tests/integration_codex.py
 
 - 这是用户态监视器，不是内核硬上限。瞬间分配、内存回收停顿、慢文件系统和不可中断 I/O 仍可能让终止来不及发生。
 - `oom_score_adj` 调整的是内核选择倾向，不能指定内核一定杀谁。启动器自身保留继承值，不尝试未经授权降低 OOM 优先级。
-- 仅保护经过启动器的命令。Paseo/agent 本身的增长、Codex 外层 shell/profile 加载、其他执行入口不在此任务预算内。
-- RSS 合计不等于任务独占物理内存；容器指标还能覆盖部分缓存和内核增长。压力来自别的服务时，被选中的任务不一定是元凶。
+- 只会终止经过启动器登记的任务；环境压力统计也包含其他服务、agent 和相关内核/缓存内存。未登记的服务不由本项目终止。
+- RSS 合计不等于任务独占物理内存，只用作受害任务选择。环境压力来自别的服务时，被选中的任务不一定是元凶。
 - 子进程仍可能修改自己的 OOM 优先级；启动器无法防御有意规避的程序。意外失去启动器时 parent-death 信号只保护直接目标，不能保证所有后代都退出。
 - 未专门实现完整交互式 shell job control；主要面向 agent 工具中的命令和由外部工具管理的后台任务。
 
-如果可以在容器配置侧提供独立子 cgroup，应优先使用每任务 `memory.max`、`memory.high` 和 `memory.oom.group` 做内核隔离，本项目作为反馈与提前终止层。
+容器或 WSL 本身的总内存配置决定环境容量。本项目不创建任务级内核内存上限，也不修改容器或 WSL 配置。
 
 ## License
 

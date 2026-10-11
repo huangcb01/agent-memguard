@@ -23,7 +23,7 @@ class HookTests(unittest.TestCase):
             (cgroup / "memory.current").write_text(str(100 * 1024**2))
             (cgroup / "memory.stat").write_text("inactive_file 0\n")
             result = subprocess.run(["/bin/bash", "-c", rewritten], capture_output=True, text=True, timeout=10,
-                                    env={**os.environ, "MEMGUARD_LIMIT": "64M",
+                                    env={**os.environ,
                                          "MEMGUARD_CGROUP_DIR": str(cgroup),
                                          "MEMGUARD_STATE_DIR": str(Path(directory) / "state")})
         self.assertEqual(result.returncode, 7, result.stderr)

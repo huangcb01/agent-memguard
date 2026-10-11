@@ -4,7 +4,7 @@ No real model is called. Global/user agent settings are not modified.
 Run: python tests/integration_codex.py
 """
 
-import os, json, threading, subprocess, tempfile, shutil, signal, time, re
+import os, json, threading, subprocess, tempfile, shutil, signal, time, re, sys, shlex
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 ROOT = Path(__file__).resolve().parents[1]
@@ -69,20 +69,39 @@ class Handler(BaseHTTPRequestHandler):
 server=ThreadingHTTPServer(("127.0.0.1",0),Handler)
 threading.Thread(target=server.serve_forever,daemon=True).start()
 try:
-    for label in ("success", "task_limit"):
+    mode = os.environ.get("MEMGUARD_MODE", "container")
+    for label in ("success", "large_healthy", "environment_pressure"):
         case = root / label
         case.mkdir()
         (case / "home").mkdir()
         state.clear()
         state.update(requests=0)
-        state["command"] = "printf MEMGUARD_SUCCESS; printf MEMGUARD_STDERR >&2; exit 7" if label=="success" else "python -c 'import time; data=bytearray(48*1024*1024); time.sleep(20)'"
+        cgroup = case / "cgroup"
+        cgroup.mkdir()
+        (cgroup / "memory.max").write_text("max" if mode == "wsl" else str(1024**3))
+        (cgroup / "memory.current").write_text(str(100 * 1024**2))
+        (cgroup / "memory.stat").write_text("inactive_file 0\n")
+        meminfo = case / "meminfo"
+        meminfo.write_text("MemTotal: 1048576 kB\nMemAvailable: 921600 kB\nSwapTotal: 2097152 kB\nSwapFree: 2097152 kB\n")
+        if label == "success":
+            state["command"] = "printf MEMGUARD_SUCCESS; printf MEMGUARD_STDERR >&2; exit 7"
+        elif label == "large_healthy":
+            state["command"] = shlex.join([sys.executable, "-c", "import time; data=bytearray(48*1024*1024); time.sleep(.2); print('MEMGUARD_GROWTH_OK')"])
+        else:
+            metrics = meminfo if mode == "wsl" else cgroup / "memory.current"
+            pressured = ("MemTotal: 1048576 kB\nMemAvailable: 65536 kB\nSwapTotal: 2097152 kB\nSwapFree: 2097152 kB\n"
+                         if mode == "wsl" else str(940 * 1024**2))
+            code = (f"import time,pathlib; temporary=pathlib.Path({str(metrics)+'.new'!r}); "
+                    f"temporary.write_text({pressured!r}); temporary.replace({str(metrics)!r}); time.sleep(10)")
+            state["command"] = shlex.join([sys.executable, "-c", code])
         (case/"home"/"config.toml").write_text('model = "gpt-6.1-sol"\nmodel_provider = "probe"\n[features]\nshell_snapshot = false\nunified_exec = true\n[model_providers.probe]\nname = "Local probe"\nbase_url = "http://127.0.0.1:'+str(server.server_port)+'/v1"\nwire_api = "responses"\nrequires_openai_auth = false\n')
 
         hook_path=str(ROOT/"bin"/"memguard-codex-hook")
         (case/"home"/"hooks.json").write_text(json.dumps({"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":hook_path,"timeout":5}]}]}}))
 
-        env=os.environ.copy();env.update(CODEX_HOME=str(case/"home"),MEMGUARD_LIMIT="128M" if label=="success" else "40M",MEMGUARD_INTERVAL="0.05",MEMGUARD_STATE_DIR=str(case/"state"))
-        env.pop("MEMGUARD_CGROUP_DIR",None)
+        env=os.environ.copy();env.update(CODEX_HOME=str(case/"home"),MEMGUARD_MODE=mode,MEMGUARD_LIMIT="1M",
+                                        MEMGUARD_INTERVAL="0.05",MEMGUARD_STATE_DIR=str(case/"state"),
+                                        MEMGUARD_CGROUP_DIR=str(cgroup),MEMGUARD_MEMINFO_FILE=str(meminfo))
         env.pop("OPENAI_API_KEY", None)
         env.pop("OPENAI_BASE_URL", None)
         env.pop("BASH_ENV", None)
@@ -106,7 +125,12 @@ try:
                 os.killpg(process.pid,signal.SIGKILL);process.wait()
         result=out.read_text(errors="replace");errors=err.read_text(errors="replace")
         outputs="\n".join(x for x in state.get("tool_outputs",[]) if isinstance(x,str))
-        passed=("code 7" in outputs and "MEMGUARD_SUCCESS" in outputs and "MEMGUARD_STDERR" in outputs) if label=="success" else ("code 125" in outputs and "task_rss_limit" in outputs)
+        if label == "success":
+            passed = "code 7" in outputs and "MEMGUARD_SUCCESS" in outputs and "MEMGUARD_STDERR" in outputs
+        elif label == "large_healthy":
+            passed = "code 0" in outputs and "MEMGUARD_GROWTH_OK" in outputs
+        else:
+            passed = "code 125" in outputs and "environment_pressure" in outputs
         print(json.dumps({"case":label,"passed":passed,"requests":state.get("requests"),"tool_outputs":state.get("tool_outputs"),"stderr_tail":errors[-500:]},ensure_ascii=False),flush=True)
         if not passed:raise RuntimeError("Codex integration failed: "+label)
 finally:

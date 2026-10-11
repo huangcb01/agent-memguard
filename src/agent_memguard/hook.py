@@ -7,6 +7,8 @@ import shlex
 import shutil
 import sys
 
+from .mode import parse_mode
+
 
 MAX_INPUT = 1024 * 1024
 
@@ -36,7 +38,10 @@ def rewrite(event: dict, guard: str) -> dict:
     shell = os.environ.get("MEMGUARD_REAL_SHELL", "/bin/bash")
     if not Path(shell).is_absolute() or not Path(shell).is_file() or not os.access(shell, os.X_OK):
         raise RuntimeError("MEMGUARD_REAL_SHELL must be an absolute executable path")
-    wrapped = shlex.join([guard, "--", shell, "-c", command])
+    # Pin the hook's mode into the command; the execution environment may
+    # differ from the hook's environment.
+    mode = parse_mode(os.environ.get("MEMGUARD_MODE", "container"))
+    wrapped = shlex.join([guard, "--mode", mode, "--", shell, "-c", command])
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow",
                                    "updatedInput": {"command": wrapped}}}
 
