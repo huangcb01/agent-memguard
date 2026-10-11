@@ -177,6 +177,96 @@ memguard --mode container -- /bin/bash -c '原命令'
 
 Codex 的异步命令可能先返回 session ID，之后再由 `write_stdin` 收取最终输出。保护终止的信息随正常命令输出通道返回。`Bash` matcher 不覆盖所有 MCP、自定义代码执行和后台工具，须逐入口验收。
 
+## WSL 安装与持久接入
+
+以下流程已在 WSL2、OpenCode 2.0.26 和 Codex 0.162.1 上验收。所有安装和配置命令在 WSL 终端执行，保护对象是 Linux 虚拟机内的命令。
+
+### 1. 安装到独立工具环境
+
+在仓库根目录执行，需要已安装 `uv`：
+
+```bash
+uv tool install --python 3.12 .
+memguard_tool_bin="$(uv tool dir --bin)"
+"$memguard_tool_bin/memguard" --mode wsl --check
+```
+
+`uv` 会安装 `memguard`、`memguard-shell` 和 `memguard-codex-hook`，默认可执行目录是 `~/.local/bin`。安装后的程序使用独立 Python 环境，运行时无需依赖仓库目录。更新仓库代码后，用 `uv tool install --force --python 3.12 .` 重新安装。
+
+### 2. 创建固定 WSL 模式的 shell 入口
+
+OpenCode 后台服务不一定继承当前终端的环境变量，因此使用包装脚本固定 `MEMGUARD_MODE=wsl`。下面的命令把安装路径写成绝对路径，并打印后续配置需要的两个入口：
+
+```bash
+python3 - "$memguard_tool_bin" <<'PY'
+from pathlib import Path
+import shlex
+import sys
+
+directory = Path(sys.argv[1]).resolve()
+wrapper = directory / "memguard-wsl-shell"
+wrapper.write_text(
+    '#!/bin/sh\nexport MEMGUARD_MODE=wsl\n'
+    + 'exec ' + shlex.quote(str(directory / "memguard-shell")) + ' "$@"\n'
+)
+wrapper.chmod(0o755)
+print("OpenCode shell:", wrapper)
+print("Codex hook: env MEMGUARD_MODE=wsl", shlex.quote(str(directory / "memguard-codex-hook")))
+PY
+
+"$memguard_tool_bin/memguard-wsl-shell" -c 'cat /proc/self/oom_score_adj'
+```
+
+最后一条命令应输出 `500`。以上两个代码块应在同一个终端依次执行；新终端可重新运行 `memguard_tool_bin="$(uv tool dir --bin)"`。
+
+### 3. 配置 OpenCode
+
+用 `opencode debug paths`、`opencode debug config` 确认实际生效的配置来源。OpenCode 2.0.26 默认用户配置为 `~/.config/opencode/opencode.jsonc`；将下面字段合并进去，路径替换为上一步打印的 OpenCode shell 入口：
+
+```json
+{
+  "shell": "/home/YOUR_USER/.local/bin/memguard-wsl-shell"
+}
+```
+
+配置中的路径必须是绝对路径；保留已有的 provider、模型及其他设置。如果正在使用独立的 `opencode2` 配置目录，也应在它的生效配置中设置同一入口。
+
+如果启用了 `opencode-pty`，先用 `opencode plugin remove opencode-pty` 禁用它，避免其独立执行入口绕过内置 shell。通过本地路径加载的 PTY 适配模块，也要从生效配置的 `plugins` 列表中移除对应路径。保存工作后，运行 `opencode service restart`，并重新打开相关 OpenCode 实例。
+
+### 4. 配置并信任 Codex hook
+
+将下面配置合并到活动 `CODEX_HOME/hooks.json`，默认是 `~/.codex/hooks.json`。保留已有 hook，把 `command` 替换为上一步打印的 Codex hook 命令：
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [{
+      "matcher": "Bash",
+      "hooks": [{
+        "type": "command",
+        "command": "env MEMGUARD_MODE=wsl /home/YOUR_USER/.local/bin/memguard-codex-hook",
+        "timeout": 5,
+        "statusMessage": "Applying WSL memory protection"
+      }]
+    }]
+  }
+}
+```
+
+命令中的 `env MEMGUARD_MODE=wsl` 固定 hook 模式；hook 再把 `--mode wsl` 写入被保护命令。无需依赖 Codex 或其后台服务继承终端的模式变量。Hooks 默认启用；如果现有 `config.toml` 明确设置了 `[features]` 下的 `hooks = false`，应改为 `true`。
+
+重新打开 Codex，在启动提示中选择 **Review hooks**，或输入 `/hooks`。进入 **PreToolUse**，核对来源是用户配置、matcher 是 `Bash`、命令路径正确且超时为 5 秒，然后按 `t` 信任该 hook。确认显示 **Trusted**，并处于启用状态；信任记录会持久保存。后续修改 hook 定义后，需要重新审阅和信任。
+
+### 5. 从实际 agent 入口验收
+
+让 OpenCode 和新打开的 Codex 会话分别执行：
+
+```bash
+cat /proc/self/oom_score_adj
+```
+
+两侧都应输出 `500`，再确认普通命令的 stdout、stderr 和退出码能够透传。直接在终端检查包装脚本只能证明启动器可运行，不能代替 agent 内的验证。模拟环境压力时，应看到 `[memguard]` 日志中的 `environment_pressure`、WSL 指标和退出码 `125`；用临时指标文件验收，无需制造真实 OOM。仓库的可选 Codex 模拟验收命令见下方“验证”，其临时配置和信任绕过不证明日常 hook 已启用。
+
 ## 输出、信号与退出码
 
 - 正常运行：stdin/stdout/stderr 直接继承；透传目标退出码，不缓存目标输出。
