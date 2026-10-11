@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-memguard"
+version = "0.1.0"
+description = "A low-overhead Linux memory guard for commands run by coding agents"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = []
+
+[project.scripts]
+memguard = "agent_memguard.cli:main"
+memguard-shell = "agent_memguard.cli:shell_main"
+memguard-codex-hook = "agent_memguard.hook:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

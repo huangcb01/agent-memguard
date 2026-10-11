@@ -1,0 +1,4 @@
+{
+  // Merge this field into the existing config; do not replace providers.
+  "shell": "/absolute/path/agent-memguard/bin/memguard-shell"
+}
