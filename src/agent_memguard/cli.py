@@ -10,7 +10,7 @@ import subprocess
 import sys
 import time
 
-from .coordinator import Coordinator, default_state_dir
+from .coordinator import AdmissionPressureError, Coordinator, default_state_dir
 from .memory import discover_cgroups, read_wsl_memory, snapshots
 from .mode import MODES, parse_mode
 from .processes import (descendants, matches, process_table, read_process,
@@ -29,8 +29,8 @@ def arguments(argv=None):
     parser.add_argument("--mode", type=parse_mode, choices=MODES,
                         default=os.environ.get("MEMGUARD_MODE", "container"),
                         help="container monitors cgroup memory; wsl also monitors VM MemAvailable (default: container)")
-    parser.add_argument("--soft-fraction", type=float, default=os.environ.get("MEMGUARD_SOFT_FRACTION", "0.8125"))
-    parser.add_argument("--hard-fraction", type=float, default=os.environ.get("MEMGUARD_HARD_FRACTION", "0.875"))
+    parser.add_argument("--soft-fraction", type=float, default=os.environ.get("MEMGUARD_SOFT_FRACTION", "0.875"))
+    parser.add_argument("--hard-fraction", type=float, default=os.environ.get("MEMGUARD_HARD_FRACTION", "0.9375"))
     parser.add_argument("--interval", type=float, default=os.environ.get("MEMGUARD_INTERVAL", "0.25"))
     parser.add_argument("--soft-duration", type=float, default=os.environ.get("MEMGUARD_SOFT_DURATION", "0.5"))
     parser.add_argument("--term-grace", type=float, default=os.environ.get("MEMGUARD_TERM_GRACE", "0.5"))
@@ -150,7 +150,8 @@ def run(options) -> int:
                 "oom_score_adj": options.oom_score_adj,
                 "state_dir": str(options.state_dir or default_state_dir()),
                 "environments": [{**m.metrics(), "soft": int(m.maximum * options.soft_fraction),
-                                  "hard": int(m.maximum * options.hard_fraction)} for m in memories],
+                                  "hard": int(m.maximum * options.hard_fraction),
+                                  "admission_threshold": int(m.maximum * options.hard_fraction)} for m in memories],
             }, indent=2))
             return 0
         set_subreaper()
@@ -158,7 +159,9 @@ def run(options) -> int:
         if owner is None:
             raise RuntimeError("cannot identify the guard process")
         coordinator = Coordinator(options.state_dir or default_state_dir(), owner.identity())
-        coordinator.register(memories, options.soft_fraction, not options.no_admission_check,
+        # Soft pressure allows short commands to finish within the existing
+        # soft-duration window; sustained pressure still elects a victim.
+        coordinator.register(memories, options.hard_fraction, not options.no_admission_check,
                              paths=monitored, table=process_table())
         registered = True
         for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
@@ -257,7 +260,12 @@ def run(options) -> int:
             # Our own exception strings can describe configuration, but never
             # dump arbitrary exception contents, command argv, or environment.
             detail = str(error) if isinstance(error, RuntimeError) else type(error).__name__
-            report("guard_error", reason=detail, exit_code=GUARD_EXIT)
+            fields = {}
+            if isinstance(error, AdmissionPressureError):
+                fields = {"phase": "admission", "command_started": False,
+                          "environments": error.environments,
+                          "suggestion": "inspect environment memory with memguard --check outside the guarded agent"}
+            report("guard_error", reason=detail, exit_code=GUARD_EXIT, **fields)
         return GUARD_EXIT
     finally:
         _cleanup(child, root)

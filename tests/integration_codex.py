@@ -4,10 +4,17 @@ No real model is called. Global/user agent settings are not modified.
 Run: python tests/integration_codex.py
 """
 
-import os, json, threading, subprocess, tempfile, shutil, signal, time, re, sys, shlex
+import os, json, threading, subprocess, tempfile, shutil, signal, time, re, sys, shlex, argparse
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 ROOT = Path(__file__).resolve().parents[1]
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--hook-bin", type=Path, default=ROOT / "bin" / "memguard-codex-hook",
+                    help="test an installed hook executable instead of the repository entry point")
+parser.add_argument("--real-memory", action="store_true",
+                    help="run only a small output/exit/OOM-preference probe against real environment metrics")
+options = parser.parse_args()
+hook_path = str(options.hook_bin.resolve())
 root = Path(tempfile.mkdtemp(prefix="memguard-codex-integration-"))
 state = {}
 class Handler(BaseHTTPRequestHandler):
@@ -70,7 +77,9 @@ server=ThreadingHTTPServer(("127.0.0.1",0),Handler)
 threading.Thread(target=server.serve_forever,daemon=True).start()
 try:
     mode = os.environ.get("MEMGUARD_MODE", "container")
-    for label in ("success", "large_healthy", "environment_pressure"):
+    labels = ("success",) if options.real_memory else (
+        "success", "large_healthy", "slab_healthy", "soft_short", "environment_pressure", "admission_pressure")
+    for label in labels:
         case = root / label
         case.mkdir()
         (case / "home").mkdir()
@@ -84,30 +93,45 @@ try:
         meminfo = case / "meminfo"
         meminfo.write_text("MemTotal: 1048576 kB\nMemAvailable: 921600 kB\nSwapTotal: 2097152 kB\nSwapFree: 2097152 kB\n")
         if label == "success":
-            state["command"] = "printf MEMGUARD_SUCCESS; printf MEMGUARD_STDERR >&2; exit 7"
+            state["command"] = "printf 'MEMGUARD_SUCCESS\\n'; printf 'MEMGUARD_STDERR\\n' >&2; printf 'OOM_ADJ=%s\\n' \"$(cat /proc/self/oom_score_adj)\"; exit 7"
         elif label == "large_healthy":
             state["command"] = shlex.join([sys.executable, "-c", "import time; data=bytearray(48*1024*1024); time.sleep(.2); print('MEMGUARD_GROWTH_OK')"])
-        else:
+        elif label == "slab_healthy":
+            (cgroup / "memory.max").write_text(str(1024**3))
+            (cgroup / "memory.current").write_text(str(1000 * 1024**2))
+            (cgroup / "memory.stat").write_text(
+                f"inactive_file {100 * 1024**2}\nslab_reclaimable {400 * 1024**2}\n")
+            state["command"] = "sleep 0.7; printf MEMGUARD_SLAB_OK"
+        elif label == "soft_short":
+            (cgroup / "memory.current").write_text(str(920 * 1024**2))
+            meminfo.write_text("MemTotal: 1048576 kB\nMemAvailable: 106496 kB\nSwapTotal: 2097152 kB\nSwapFree: 2097152 kB\n")
+            state["command"] = "printf MEMGUARD_SOFT_SHORT_OK"
+        elif label == "environment_pressure":
             metrics = meminfo if mode == "wsl" else cgroup / "memory.current"
-            pressured = ("MemTotal: 1048576 kB\nMemAvailable: 65536 kB\nSwapTotal: 2097152 kB\nSwapFree: 2097152 kB\n"
-                         if mode == "wsl" else str(940 * 1024**2))
+            pressured = ("MemTotal: 1048576 kB\nMemAvailable: 32768 kB\nSwapTotal: 2097152 kB\nSwapFree: 2097152 kB\n"
+                         if mode == "wsl" else str(990 * 1024**2))
             code = (f"import time,pathlib; temporary=pathlib.Path({str(metrics)+'.new'!r}); "
                     f"temporary.write_text({pressured!r}); temporary.replace({str(metrics)!r}); time.sleep(10)")
             state["command"] = shlex.join([sys.executable, "-c", code])
+        else:
+            (cgroup / "memory.current").write_text(str(990 * 1024**2))
+            meminfo.write_text("MemTotal: 1048576 kB\nMemAvailable: 32768 kB\nSwapTotal: 2097152 kB\nSwapFree: 2097152 kB\n")
+            state["command"] = "printf MEMGUARD_SHOULD_NOT_RUN"
         (case/"home"/"config.toml").write_text('model = "gpt-6.1-sol"\nmodel_provider = "probe"\n[features]\nshell_snapshot = false\nunified_exec = true\n[model_providers.probe]\nname = "Local probe"\nbase_url = "http://127.0.0.1:'+str(server.server_port)+'/v1"\nwire_api = "responses"\nrequires_openai_auth = false\n')
 
-        hook_path=str(ROOT/"bin"/"memguard-codex-hook")
         (case/"home"/"hooks.json").write_text(json.dumps({"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":hook_path,"timeout":5}]}]}}))
 
-        env=os.environ.copy();env.update(CODEX_HOME=str(case/"home"),MEMGUARD_MODE=mode,MEMGUARD_LIMIT="1M",
-                                        MEMGUARD_INTERVAL="0.05",MEMGUARD_STATE_DIR=str(case/"state"),
-                                        MEMGUARD_CGROUP_DIR=str(cgroup),MEMGUARD_MEMINFO_FILE=str(meminfo))
+        env={key:value for key,value in os.environ.items() if not key.startswith("MEMGUARD_")}
+        env.update(CODEX_HOME=str(case/"home"),MEMGUARD_MODE=mode,MEMGUARD_LIMIT="1M",
+                   MEMGUARD_INTERVAL="0.05",MEMGUARD_STATE_DIR=str(case/"state"))
+        if not options.real_memory:
+            env.update(MEMGUARD_CGROUP_DIR=str(cgroup),MEMGUARD_MEMINFO_FILE=str(meminfo))
         env.pop("OPENAI_API_KEY", None)
         env.pop("OPENAI_BASE_URL", None)
         env.pop("BASH_ENV", None)
         out=case/"stdout";err=case/"stderr"
         with out.open("wb") as stdout,err.open("wb") as stderr:
-            process=subprocess.Popen(["codex","--dangerously-bypass-hook-trust","exec","--json","--skip-git-repo-check","--sandbox","danger-full-access","-C",str(case),"Run the shell probe."],env=env,stdout=stdout,stderr=stderr,start_new_session=True)
+            process=subprocess.Popen(["codex","--no-daemon","--dangerously-bypass-hook-trust","exec","--json","--skip-git-repo-check","--sandbox","danger-full-access","-C",str(case),"Run the shell probe."],env=env,stdout=stdout,stderr=stderr,start_new_session=True)
             deadline=time.monotonic()+55
             reason=None
             while process.poll() is None:
@@ -126,11 +150,20 @@ try:
         result=out.read_text(errors="replace");errors=err.read_text(errors="replace")
         outputs="\n".join(x for x in state.get("tool_outputs",[]) if isinstance(x,str))
         if label == "success":
-            passed = "code 7" in outputs and "MEMGUARD_SUCCESS" in outputs and "MEMGUARD_STDERR" in outputs
+            passed = "code 7" in outputs and "MEMGUARD_SUCCESS" in outputs and "MEMGUARD_STDERR" in outputs and "OOM_ADJ=500" in outputs
         elif label == "large_healthy":
             passed = "code 0" in outputs and "MEMGUARD_GROWTH_OK" in outputs
-        else:
+        elif label == "slab_healthy":
+            passed = "code 0" in outputs and "MEMGUARD_SLAB_OK" in outputs
+        elif label == "soft_short":
+            passed = "code 0" in outputs and "MEMGUARD_SOFT_SHORT_OK" in outputs
+        elif label == "environment_pressure":
             passed = "code 125" in outputs and "environment_pressure" in outputs
+        else:
+            passed = ("code 125" in outputs and "environment memory pressure too high" in outputs
+                      and '"command_started": false' in outputs and '"environments"' in outputs
+                      and "MEMGUARD_SHOULD_NOT_RUN" not in outputs)
+        passed = passed and reason is None and process.returncode == 0
         print(json.dumps({"case":label,"passed":passed,"requests":state.get("requests"),"tool_outputs":state.get("tool_outputs"),"stderr_tail":errors[-500:]},ensure_ascii=False),flush=True)
         if not passed:raise RuntimeError("Codex integration failed: "+label)
 finally:

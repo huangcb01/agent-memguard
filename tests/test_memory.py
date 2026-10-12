@@ -21,8 +21,20 @@ class MemoryTests(unittest.TestCase):
             path = Path(name)
             (path / "memory.max").write_text("8000")
             (path / "memory.current").write_text("7900")
-            (path / "memory.stat").write_text("inactive_file 4000\nfile_dirty 200\nfile_writeback 100\n")
-            self.assertEqual(read_memory(path).working_set, 4200)
+            (path / "memory.stat").write_text("inactive_file 4000\nfile_dirty 200\nfile_writeback 100\n"
+                                              "slab_reclaimable 2000\nslab_unreclaimable 300\n")
+            memory = read_memory(path)
+            # Dirty/writeback and unreclaimable slab stay charged; retain
+            # half of reclaimable slab rather than deducting all of it.
+            self.assertEqual(memory.working_set, 3200)
+            self.assertEqual(memory.metrics()["slab_reclaimable_credit"], 1000)
+            self.assertEqual(memory.metrics()["slab_reclaimable"], 2000)
+            self.assertEqual(memory.metrics()["slab_unreclaimable"], 300)
+            self.assertEqual(memory.metrics()["inactive_file"], 4000)
+            # File and slab counters can be ahead of memory.current across
+            # separate kernel samples. Never report negative usage.
+            (path / "memory.current").write_text("500")
+            self.assertEqual(read_memory(path).working_set, 0)
             (path / "memory.max").write_text("max")
             self.assertIsNone(read_memory(path))
 

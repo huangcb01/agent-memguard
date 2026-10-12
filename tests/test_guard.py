@@ -151,7 +151,7 @@ class GuardTests(unittest.TestCase):
         code = ("import subprocess,sys,time,pathlib; p=[subprocess.Popen([sys.executable,'-c',%r]) for _ in range(2)]; "
                 "pathlib.Path(%r).write_text(','.join(str(x.pid) for x in p)); time.sleep(.2); "
                 "temporary=pathlib.Path(%r); temporary.write_text(%r); temporary.replace(%r); time.sleep(10)"
-                % (worker, str(pid_file), str(current.with_suffix('.new')), str(940 * 1024**2), str(current)))
+                % (worker, str(pid_file), str(current.with_suffix('.new')), str(990 * 1024**2), str(current)))
         result = self.run_guard([sys.executable, "-c", code])
         self.assertEqual(result.returncode, 125, result.stderr)
         for pid in pid_file.read_text().split(","):
@@ -168,7 +168,7 @@ class GuardTests(unittest.TestCase):
         current = self.cgroup / "memory.current"
         code = ("import signal,time,pathlib; signal.signal(signal.SIGTERM,signal.SIG_IGN); data=bytearray(48*1024*1024); "
                 "temporary=pathlib.Path(%r); temporary.write_text(%r); temporary.replace(%r); time.sleep(10)"
-                % (str(current.with_suffix('.new')), str(850 * 1024**2), str(current)))
+                % (str(current.with_suffix('.new')), str(920 * 1024**2), str(current)))
         result = self.run_guard([sys.executable, "-c", code], options=("--soft-duration", "0", "--term-grace", "0.1"))
         self.assertEqual(result.returncode, 125, result.stderr)
         self.assertIn('"signal": "SIGKILL"', result.stderr)
@@ -180,11 +180,48 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_insufficient_headroom_refuses_before_exec(self):
-        (self.cgroup / "memory.current").write_text(str(900 * 1024**2))
+        (self.cgroup / "memory.current").write_text(str(990 * 1024**2))
         marker = self.directory / "should_not_exist"
         result = self.run_guard(["/usr/bin/touch", str(marker)])
         self.assertEqual(result.returncode, 125)
         self.assertFalse(marker.exists())
+        event = json.loads(result.stderr.removeprefix("[memguard] "))
+        self.assertEqual(event["phase"], "admission")
+        self.assertFalse(event["command_started"])
+        self.assertTrue(event["environments"][0]["pressured"])
+        self.assertEqual(event["environments"][0]["working_set"], 990 * 1024**2)
+        self.assertEqual(event["environments"][0]["admission_threshold"], int(.9375 * 1024**3))
+        self.assertNotIn(str(marker), result.stderr)
+
+    def test_reclaimable_slab_allows_cached_environment_without_disabling_protection(self):
+        (self.cgroup / "memory.current").write_text(str(1000 * 1024**2))
+        (self.cgroup / "memory.stat").write_text(
+            f"inactive_file {100 * 1024**2}\nslab_reclaimable {400 * 1024**2}\n")
+        # Without slab credit this sample would sustain soft pressure.
+        result = self.run_guard(["/bin/sleep", "0.7"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # The remaining safety margin must still reject hard pressure: all
+        # slab being reclaimable is not a reason to ignore genuine pressure.
+        (self.cgroup / "memory.stat").write_text(f"inactive_file 0\nslab_reclaimable {64 * 1024**2}\n")
+        marker = self.directory / "hard_pressure_marker"
+        result = self.run_guard(["/usr/bin/touch", str(marker)])
+        self.assertEqual(result.returncode, 125, result.stderr)
+        self.assertFalse(marker.exists())
+
+    def test_soft_pressure_allows_short_commands_but_still_terminates_long_tasks(self):
+        (self.cgroup / "memory.current").write_text(str(920 * 1024**2))
+        result = self.run_guard(["/bin/echo", "short-command-completed"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("short-command-completed", result.stdout)
+        result = self.run_guard(["/bin/sleep", "10"])
+        self.assertEqual(result.returncode, 125, result.stderr)
+        self.assertIn('"reason": "environment_pressure"', result.stderr)
+        self.assertIn('"signal": "SIGTERM"', result.stderr)
+
+    def test_old_soft_pressure_is_allowed_by_higher_defaults(self):
+        (self.cgroup / "memory.current").write_text(str(850 * 1024**2))
+        result = self.run_guard(["/bin/sleep", "0.7"])
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_monitor_failure_kills_task(self):
         pid_file = self.directory / "pid"
@@ -226,7 +263,7 @@ class GuardTests(unittest.TestCase):
                 processes.append(process);pid_files.append(pid_file)
                 self.wait_file(pid_file, process)
             self.wait_stable_rss(processes, (8, 24))
-            self.set_current(940 * 1024**2)
+            self.set_current(990 * 1024**2)
             deadline = time.monotonic() + 5
             while all(p.poll() is None for p in processes) and time.monotonic() < deadline:
                 time.sleep(0.01)
@@ -252,7 +289,7 @@ class GuardTests(unittest.TestCase):
             for i, size in enumerate((8, 24)):
                 pid_file = self.directory / f"threshold_pid{i}"
                 code = "import os,time,pathlib; x=bytearray(%d*1024*1024); pathlib.Path(%r).write_text(str(os.getpid())); time.sleep(10)" % (size, str(pid_file))
-                options = [] if i == 0 else ["--soft-fraction", ".9", "--hard-fraction", ".99"]
+                options = [] if i == 0 else ["--soft-fraction", ".97", "--hard-fraction", ".99"]
                 process = subprocess.Popen([*self.base, *options, "--", sys.executable, "-c", code],
                                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                 processes.append(process)
@@ -260,7 +297,7 @@ class GuardTests(unittest.TestCase):
             # Nonzero RSS can still describe the exec helper. Wait for the
             # allocations to be sampled and the initial growth to settle.
             self.wait_stable_rss(processes, (8, 24))
-            self.set_current(int(.89 * 1024**3))
+            self.set_current(int(.95 * 1024**3))
             _, stderr = processes[1].communicate(timeout=5)
             self.set_current(100 * 1024**2)
             self.assertEqual(processes[1].returncode, 125, stderr)
@@ -287,7 +324,7 @@ class GuardTests(unittest.TestCase):
             self.wait_registry(lambda d: any(t["owner"]["pid"] == processes[0].pid and
                                             t["rss"] > 24 * 1024**2 for t in d["tasks"].values()), processes)
             victim_pid = int((self.directory / "slow_pid0").read_text())
-            self.set_current(940 * 1024**2)
+            self.set_current(990 * 1024**2)
             deadline = time.monotonic() + 1.5
             while time.monotonic() < deadline:
                 victim = read_process(victim_pid)
@@ -338,14 +375,14 @@ class GuardTests(unittest.TestCase):
                 processes.append(process)
                 self.wait_file(pid_file, process)
             self.wait_stable_rss(processes, (8, 24))
-            self.set_current(850 * 1024**2)
+            self.set_current(920 * 1024**2)
             self.wait_registry(lambda d: any(task["owner"]["pid"] == processes[1].pid and
                                             task["termination"] and task["termination"]["signal"] == "SIGTERM"
                                             for task in d["tasks"].values()), processes)
             # The owner cannot perform its usual TERM-to-KILL escalation.
             self.stop_guard(processes[1])
             self.set_current(100 * 1024**2)
-            self.set_current(940 * 1024**2, parent)
+            self.set_current(990 * 1024**2, parent)
             self.wait_registry(lambda d: any(task["owner"]["pid"] == processes[1].pid and
                                             task["termination"] and task["termination"]["signal"] == "SIGKILL"
                                             for task in d["tasks"].values()), processes, timeout=2)
@@ -387,7 +424,7 @@ class GuardTests(unittest.TestCase):
                 self.wait_file(pid_file, process)
             self.wait_stable_rss(processes, (8, 24))
             self.stop_guard(processes[1])
-            self.set_current(940 * 1024**2)
+            self.set_current(990 * 1024**2)
             self.wait_registry(lambda d: any(task["owner"]["pid"] == processes[1].pid and task.get("released")
                                             for task in d["tasks"].values()), processes, timeout=3)
             self.assert_dead(int((self.directory / "sustained_pid1").read_text()))
@@ -432,12 +469,12 @@ class GuardTests(unittest.TestCase):
                 processes.append(process)
                 self.wait_file(pid_file, process)
             self.wait_stable_rss(processes, (8, 24))
-            self.set_current(850 * 1024**2)
+            self.set_current(920 * 1024**2)
             self.wait_registry(lambda d: any(task["owner"]["pid"] == processes[0].pid and
                                             task["termination"] and task["termination"]["signal"] == "SIGTERM"
                                             for task in d["tasks"].values()), processes)
             self.stop_guard(processes[0])
-            self.set_current(940 * 1024**2, sibling)
+            self.set_current(990 * 1024**2, sibling)
             _, stderr = processes[1].communicate(timeout=2)
             self.assertEqual(processes[1].returncode, 125, stderr)
             self.assertIn('"reason": "environment_pressure"', stderr)

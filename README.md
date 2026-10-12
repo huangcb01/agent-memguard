@@ -50,13 +50,13 @@ export MEMGUARD_MODE=wsl        # WSL2
 
 WSL 模式每次采样读取 `/proc/meminfo` 的 `MemTotal`、`MemAvailable`，用 `MemTotal - MemAvailable` 表示已占用且不易回收的内存；可回收缓存由内核的 `MemAvailable` 估算。若存在有限 cgroup 上限，也同时监控这些层级。读取原生 `/proc/meminfo` 前会确认当前是 WSL 内核；容器模式不会回退读取可能属于宿主机的指标。WSL 保护范围是 Linux 虚拟机，不包含 Windows 原生进程。
 
-启动前只检查环境是否已经达到软压力阈值，不为每个任务预留固定预算。运行中持续重读总量、可用量及有限 cgroup 范围；上限或可用内存变化后，会按最新指标判断压力。
+启动前检查环境是否已经达到硬压力阈值，不为每个任务预留固定预算。软压力下允许启动，短命令可在软阈值持续时间内完成；长期承压仍会触发运行中的保护。运行中持续重读总量、可用量及有限 cgroup 范围；上限或可用内存变化后，会按最新指标判断压力。
 
 旧版的 `--limit`、`--allow-unlimited` 参数已移除，调用脚本需要删除这些参数。`MEMGUARD_LIMIT` 不再使用，也不再提供 RSS-only 模式。更新后重启现有启动器，使所有任务统一采用新的保护策略。
 
 ## 保护机制
 
-1. 启动前读取环境内存，若已经达到软阈值则拒绝启动；通过后登记任务和所属环境层级。
+1. 启动前读取环境内存，若已经达到硬阈值则拒绝启动；通过后登记任务和所属环境层级。
 2. 将任务放进独立会话，执行目标程序前把 `oom_score_adj` 设置为 `+500`。避免高内存命令继承 Paseo/agent 的负值保护。设置失败时不执行命令。
 3. 每 250 ms 读取环境指标和 `/proc`，统计任务后代 RSS 及增长量，用于受害任务排序。共享内存可能重复计算，但不会因此限制任务大小。
 4. 环境达到软阈值并持续 500 ms 时，优先选择 RSS 大、近期增长明显的任务，发送 TERM。同一承压层级的并发启动器协调选一个任务。
@@ -66,11 +66,14 @@ WSL 模式每次采样读取 `/proc/meminfo` 的 `MemTotal`、`MemAvailable`，�
 容器工作集估算（只计算实际已使用内存，不含未来任务预算）：
 
 ```text
-可回收部分 = max(0, inactive_file - file_dirty - file_writeback)
-工作集估算 = max(0, memory.current - 可回收部分)
+文件缓存折算 = max(0, inactive_file - file_dirty - file_writeback)
+内核缓存折算 = floor(max(0, slab_reclaimable) / 2)
+工作集估算 = max(0, memory.current - 文件缓存折算 - 内核缓存折算)
 ```
 
-这不是精确的不可回收内存量。不会把 `slab_reclaimable` 全部扣除；容器模式不读取 `/proc/meminfo`。
+这不是精确的不可回收内存量。`slab_reclaimable` 仅扣除一半，另一半保留为回收不及时或不完全的余量；不扣除 `slab_unreclaimable`。50% 是保守的固定估算，并非内核对即时可回收量的保证。日志同时报告原始缓存量和 `slab_reclaimable_credit`，可检查判断依据。WSL 的 `MemAvailable` 已包含内核回收估算，不再次扣除 slab；容器模式不读取可能属于宿主机的 `/proc/meminfo`。
+
+启动器不会主动清空系统缓存或修改 cgroup。缓存折算减少提前触发，但运行中的软/硬压力保护仍按上述工作集估算执行，并不能保证等到内核完成回收后才终止。升级后应统一更新受保护入口，避免旧启动器继续按旧的缓存估算和准入阈值判断。
 
 会检查本进程 cgroup 到可见挂载根之间所有有限上限。任一有限层级触发压力即可保护。
 
@@ -90,8 +93,8 @@ WSL 模式报告 `SwapTotal` 与 `SwapTotal - SwapFree`；容器模式在指标�
 
 | 参数 | 默认值 | 对 8 GiB 容器的含义 |
 | --- | --- | --- |
-| 环境软阈值 | 81.25% | 6.5 GiB 工作集估算，约剩余 1.5 GiB |
-| 环境硬阈值 | 87.5% | 7 GiB 工作集估算，约剩余 1 GiB |
+| 环境软阈值 | 87.5% | 7 GiB 工作集估算，约剩余 1 GiB |
+| 环境硬阈值（也用于准入） | 93.75% | 7.5 GiB 工作集估算，约剩余 0.5 GiB |
 | 采样间隔 | 250 ms | 读取 cgroup 和进程树 |
 | 软阈值持续时间 | 500 ms | 避免短暂波动 |
 | TERM 宽限 | 500 ms | 硬阈值不等待 |
@@ -105,8 +108,8 @@ shell 和 hook 模式使用环境变量调整：
 export MEMGUARD_MODE=container  # WSL2 使用 wsl
 export MEMGUARD_REAL_SHELL=/bin/bash
 export MEMGUARD_INTERVAL=0.25
-export MEMGUARD_SOFT_FRACTION=0.8125
-export MEMGUARD_HARD_FRACTION=0.875
+export MEMGUARD_SOFT_FRACTION=0.875
+export MEMGUARD_HARD_FRACTION=0.9375
 export MEMGUARD_SOFT_DURATION=0.5
 export MEMGUARD_TERM_GRACE=0.5
 export MEMGUARD_OOM_SCORE_ADJ=500
@@ -141,6 +144,8 @@ cat /proc/self/oom_score_adj
 本机研究针对 OpenCode 2.0.26：自定义路径不存在时可能回退系统 Bash。因此必须确保配置路径存在且可执行，并用模拟环境压力验收保护。
 
 独立 PTY 插件和 MCP 工具可能直接启动程序，绕过内置 shell；需要另外包装其执行入口，或者禁用这些入口。
+
+OpenCode 2.0.26 的底层 `/api/shell` 请求可能在未加载会话运行配置时使用系统 Bash，即使配置文件已有自定义 `shell`。实际接入应从会话入口验收，例如 `/api/session/{sessionID}/shell`，核对执行路径、`oom_score_adj=500`、stdout/stderr 和退出码。会话入口通过验收不表示底层 API、独立 PTY 或 MCP 入口也已受保护。
 
 ## Codex 接入
 
@@ -277,6 +282,14 @@ cat /proc/self/oom_score_adj
 
 目标本身也可能返回 125；应结合 stderr 中的 `[memguard]` 事件区分原因。
 
+### 安装后所有命令都返回 125
+
+若日志是 `environment memory pressure too high to start a task`，启动器在准入阶段拒绝了命令，目标程序尚未执行。这与命令被内核 OOM 杀掉不同；整体工作集达到硬阈值时，即使 `true` 也会被拒绝。默认 8 GiB 容器的准入阈值为 7.5 GiB，不是按待执行命令的大小判断。旧版本使用 6.5 GiB 软阈值准入，可能在轻度压力下阻止所有命令；新版允许软压力下的短命令执行，持续压力下的长任务仍可被终止。
+
+准入拒绝日志包含 `phase: "admission"`、`command_started: false`，以及各环境的 `current`、`working_set`、`admission_threshold`、`pressured` 和缓存明细。在 agent 外的普通终端执行 `memguard --check`，查看哪个层级超过阈值；容器还可读取对应层级的 `memory.events`，检查 `oom`、`oom_kill` 的变化。退出码 125 本身不能证明内核 OOM。
+
+AFS/NFS 大量文件操作可能积累 `slab_reclaimable`。旧版本把它全部计入工作集，新版仅计入一半，以减少缓存造成的提前拒绝。旧日志没有拒绝时的指标时，不能仅凭报错判断是否误触发。优先检查整体服务占用和缓存构成，不要通过关闭运行时保护来排查。
+
 日志示例：
 
 ```text
@@ -300,6 +313,14 @@ python3 tests/integration_codex.py
 ```
 
 使用本地 HTTP 模拟模型、临时 `CODEX_HOME` 和一次性 hook 信任绕过，验收正常命令 stdout/stderr/退出码 7、宽裕内存下的大任务成功，以及模拟环境压力下的退出码 125。模拟模型会用 `write_stdin` 收取异步结果，不修改日常配置、不调用真实模型，不制造真实 OOM。容器和 WSL 指标均使用临时文件，WSL 场景使用 `MEMGUARD_MODE=wsl python3 tests/integration_codex.py`。
+
+还会验收可回收 slab 较多时长任务正常执行、软压力下短命令完成、命令执行前的硬压力准入拒绝及其指标，并检查正常命令的 `oom_score_adj` 为 `500`。测试使用 `--no-daemon` 避免连接日常 Codex 后台服务，清除继承的 `MEMGUARD_*` 设置后应用测试配置。要验证已经安装的程序与真实环境指标，可在普通终端运行：
+
+```bash
+python3 tests/integration_codex.py --real-memory --hook-bin /absolute/path/to/memguard-codex-hook
+```
+
+这个模式只执行小型输出/退出码/优先级检查；不会分配大块内存或修改真实 cgroup。当前环境已承压时检查会失败并显示启动器原因。
 
 可选 GitHub Actions 模板在 [examples/github-actions.yml](examples/github-actions.yml)。复制到 `.github/workflows/tests.yml` 可启用 Python 3.10/3.12/3.13 的测试矩阵。
 

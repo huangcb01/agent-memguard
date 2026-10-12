@@ -13,6 +13,16 @@ import time
 from .processes import Process, descendants, matches
 
 
+class AdmissionPressureError(RuntimeError):
+    """Keep the rejected sample so callers can explain a pre-exec refusal."""
+
+    def __init__(self, memories, admission_fraction: float):
+        super().__init__("environment memory pressure too high to start a task")
+        self.environments = [{**memory.metrics(), "admission_threshold": int(memory.maximum * admission_fraction),
+                              "pressured": memory.working_set >= memory.maximum * admission_fraction}
+                             for memory in memories]
+
+
 def default_state_dir() -> Path:
     runtime = os.environ.get("XDG_RUNTIME_DIR")
     if runtime:
@@ -95,7 +105,7 @@ class Coordinator:
         for request in data["requests"].values():
             request["domain"] = list(data["tasks"][request["victim"]]["scopes"])
 
-    def register(self, memories, soft_fraction: float, admission: bool,
+    def register(self, memories, admission_fraction: float, admission: bool,
                  paths: list[Path] | None = None, table: dict[int, Process] | None = None) -> None:
         with self.locked() as data:
             self._finish_exited_tasks(data, table)
@@ -104,8 +114,8 @@ class Coordinator:
             self._refresh_scopes(data, monitored, scopes)
             if admission:
                 for memory in memories:
-                    if memory.working_set >= memory.maximum * soft_fraction:
-                        raise RuntimeError("environment memory pressure too high to start a task")
+                    if memory.working_set >= memory.maximum * admission_fraction:
+                        raise AdmissionPressureError(memories, admission_fraction)
             data["tasks"][self.identifier] = {
                 "owner": self.owner, "rss": 0, "growth": 0,
                 "updated": time.monotonic(), "root": None,

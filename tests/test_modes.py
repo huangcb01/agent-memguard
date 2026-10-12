@@ -63,6 +63,8 @@ class ModeTests(unittest.TestCase):
         self.assertEqual(len(settings["environments"]), 1)
         self.assertEqual(settings["environments"][0]["source"], "wsl")
         self.assertEqual(settings["environments"][0]["available"], 900 * 1024**2)
+        self.assertEqual(settings["environments"][0]["soft"], int(.875 * 1024**3))
+        self.assertEqual(settings["environments"][0]["hard"], int(.9375 * 1024**3))
 
     def test_cli_mode_overrides_environment_in_both_directions(self):
         for mode, environment_mode, expected in (("wsl", "container", 0), ("container", "wsl", 125)):
@@ -99,7 +101,7 @@ class ModeTests(unittest.TestCase):
                 self.assertEqual(len(settings["environments"]), 2 if mode == "wsl" else 1)
 
     def test_wsl_mode_still_enforces_finite_cgroup_admission(self):
-        self.finite_cgroup(900 * 1024**2)
+        self.finite_cgroup(990 * 1024**2)
         marker = self.directory / "marker"
         result = self.launch(["--mode", "wsl", "--", "/usr/bin/touch", str(marker)])
         self.assertEqual(result.returncode, 125, result.stderr)
@@ -107,7 +109,7 @@ class ModeTests(unittest.TestCase):
         self.assertFalse(marker.exists())
 
     def test_wsl_mode_still_terminates_on_finite_cgroup_pressure(self):
-        self.finite_cgroup(940 * 1024**2)
+        self.finite_cgroup(990 * 1024**2)
         result = self.launch(["--mode", "wsl", "--no-admission-check", "--", "/bin/sleep", "10"])
         self.assertEqual(result.returncode, 125, result.stderr)
         self.assertIn('"reason": "environment_pressure"', result.stderr)
@@ -126,7 +128,7 @@ class ModeTests(unittest.TestCase):
                     self.fail("task did not start without a finite limit")
                 time.sleep(.01)
             # Publish complete counter values, matching kernel file semantics.
-            for name, value in (("memory.current", 940 * 1024**2), ("memory.max", 1024**3)):
+            for name, value in (("memory.current", 990 * 1024**2), ("memory.max", 1024**3)):
                 temporary = self.cgroup / (name + ".new")
                 temporary.write_text(str(value))
                 temporary.replace(self.cgroup / name)
@@ -189,8 +191,10 @@ class ModeTests(unittest.TestCase):
         self.assertTrue(task is None or not task.alive)
 
     def test_wsl_soft_pressure_sends_term_after_duration(self):
-        self.set_wsl_available(160 * 1024**2)
-        result = self.launch(["--mode", "wsl", "--no-admission-check", "--soft-duration", ".1", "--",
+        self.set_wsl_available(104 * 1024**2)
+        # Soft pressure is now admitted without needing an override, while
+        # WSL's MemAvailable-based runtime protection still applies.
+        result = self.launch(["--mode", "wsl", "--soft-duration", ".1", "--",
                               "/bin/sleep", "10"])
         self.assertEqual(result.returncode, 125, result.stderr)
         self.assertIn('"reason": "environment_pressure"', result.stderr)

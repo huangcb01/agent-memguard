@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from agent_memguard.coordinator import Coordinator
+from agent_memguard.coordinator import AdmissionPressureError, Coordinator
 from agent_memguard.memory import Memory
 from agent_memguard.processes import Process
 
@@ -49,8 +49,14 @@ class CoordinatorTests(unittest.TestCase):
         first = self.coordinator(1)
         second = self.coordinator(2)
         first.register([self.memory(self.first), self.memory(self.parent)], .8125, True)
-        with self.assertRaisesRegex(RuntimeError, "environment memory pressure"):
+        with self.assertRaisesRegex(AdmissionPressureError, "environment memory pressure") as refusal:
             second.register([self.memory(self.second), self.memory(self.parent, current=900)], .8125, True)
+        environments = refusal.exception.environments
+        self.assertFalse(environments[0]["pressured"])
+        self.assertTrue(environments[1]["pressured"])
+        self.assertEqual(environments[1]["path"], str(self.parent))
+        self.assertEqual(environments[1]["working_set"], 900)
+        self.assertEqual(environments[1]["admission_threshold"], 812)
 
     def test_sibling_parent_pressure_elects_largest_task_once(self):
         first = self.coordinator(1)

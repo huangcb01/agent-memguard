@@ -30,21 +30,36 @@ class Memory:
     source: str = "cgroup"
     swap_current: int | None = None
     swap_maximum: int | None = None
+    slab_reclaimable: int = 0
+    slab_unreclaimable: int = 0
 
     @property
     def working_set(self) -> int:
         # Dirty/writeback pages cannot be assumed immediately reclaimable.
-        reclaimable = max(0, self.inactive_file - self.dirty - self.writeback)
-        return max(0, self.current - reclaimable)
+        reclaimable_file = max(0, self.inactive_file - self.dirty - self.writeback)
+        # Slab reclaim can be slow or incomplete (e.g. referenced dentries).
+        # Credit only half, retaining the other half as a safety margin. WSL
+        # already uses MemAvailable, so must not receive a second deduction.
+        reclaimable_slab = self.slab_reclaimable_credit
+        return max(0, self.current - reclaimable_file - reclaimable_slab)
+
+    @property
+    def slab_reclaimable_credit(self) -> int:
+        return max(0, self.slab_reclaimable) // 2 if self.source == "cgroup" else 0
 
     @property
     def available(self) -> int:
         return max(0, self.maximum - self.working_set)
 
     def metrics(self) -> dict:
-        return {"source": self.source, "path": self.path, "maximum": self.maximum,
-                "current": self.current, "working_set": self.working_set, "available": self.available,
-                "swap_current": self.swap_current, "swap_maximum": self.swap_maximum}
+        result = {"source": self.source, "path": self.path, "maximum": self.maximum,
+                  "current": self.current, "working_set": self.working_set, "available": self.available,
+                  "swap_current": self.swap_current, "swap_maximum": self.swap_maximum}
+        if self.source == "cgroup":
+            result.update(inactive_file=self.inactive_file, file_dirty=self.dirty, file_writeback=self.writeback,
+                          slab_reclaimable=self.slab_reclaimable, slab_unreclaimable=self.slab_unreclaimable,
+                          slab_reclaimable_credit=self.slab_reclaimable_credit)
+        return result
 
 
 def read_memory(path: Path) -> Memory | None:
@@ -61,7 +76,9 @@ def read_memory(path: Path) -> Memory | None:
     return Memory(str(path), maximum_int, current, int(stats.get("inactive_file", 0)),
                   int(stats.get("file_dirty", 0)), int(stats.get("file_writeback", 0)),
                   swap_current=int(swap_current) if swap_current is not None else None,
-                  swap_maximum=int(swap_maximum) if swap_maximum not in (None, "max") else None)
+                  swap_maximum=int(swap_maximum) if swap_maximum not in (None, "max") else None,
+                  slab_reclaimable=int(stats.get("slab_reclaimable", 0)),
+                  slab_unreclaimable=int(stats.get("slab_unreclaimable", 0)))
 
 
 def read_wsl_memory(path: Path) -> Memory:
